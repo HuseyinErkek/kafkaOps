@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kafka Load Tester</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #fafafa; padding: 40px 20px; font-family: sans-serif; }
+        .stat-card { background: white; padding: 30px 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); text-align: center; border: 1px solid #eee; }
+        .stat-card.small { padding: 18px 20px; }
+        .stat-value { font-size: 3rem; font-weight: bold; margin-top: 10px; }
+        .stat-card.small .stat-value { font-size: 1.8rem; margin-top: 4px; }
+        .val-success { color: #198754; }
+        .val-danger { color: #dc3545; }
+        .val-dark { color: #212529; }
+        #eventLog {
+            background: #212529; color: #d6d9dc; border-radius: 8px;
+            padding: 14px 16px; height: 220px; overflow-y: auto;
+            font-family: ui-monospace, Menlo, monospace; font-size: 0.85rem;
+            white-space: pre-wrap; margin: 0;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <!-- Başlık ve Bağlantı Durumu -->
+    <div class="d-flex justify-content-between align-items-center mb-4 border-bottom pb-3">
+        <h2>Kafka Load Tester</h2>
+        <span id="connectionStatus" class="badge bg-secondary p-2 fs-6">WebSocket Bekleniyor...</span>
+    </div>
+
+    <!-- Geri bildirim alanı -->
+    <div id="feedback" class="alert d-none" role="alert"></div>
+
+    <!-- Giriş Alanları -->
+    <div class="row mb-4 g-3">
+        <div class="col-md-2">
+            <label class="form-label text-muted">Mesaj Boyutu (karakter)</label>
+            <input type="number" id="msgSize" class="form-control" value="10000" min="1">
+        </div>
+        <div class="col-md-2">
+            <label class="form-label text-muted">Mesaj Sayısı (Tam Yük için)</label>
+            <input type="number" id="msgCount" class="form-control" value="100000" min="1">
+        </div>
+        <div class="col-md-2">
+            <label class="form-label text-muted">Hız (msg/sn)</label>
+            <input type="number" id="msgRate" class="form-control" value="1000" min="1">
+        </div>
+        <div class="col-md-2">
+            <label class="form-label text-muted">Paralel Thread</label>
+            <input type="number" id="concurrency" class="form-control" value="1" min="1" max="64">
+        </div>
+        <div class="col-md-4">
+            <label class="form-label text-muted">Topic</label>
+            <input type="text" id="topicName" class="form-control" value="broker-load-test">
+        </div>
+    </div>
+
+    <!-- Butonlar -->
+    <div class="d-flex gap-3 mb-5">
+        <button class="btn btn-success flex-fill py-2 fw-bold" onclick="startTest('CONTINUOUS')">Sürekli Başlat</button>
+        <button class="btn btn-warning flex-fill py-2 fw-bold" onclick="startTest('BURST')">Tam Yük Testi (Zorla)</button>
+        <button class="btn btn-light border flex-fill py-2 fw-bold" onclick="stopTest()">Durdur</button>
+        <button class="btn btn-info text-white flex-fill py-2 fw-bold" onclick="markEvent()">Olay İşaretle</button>
+    </div>
+
+    <!-- İstatistik Kartları -->
+    <div class="row g-3 mb-3">
+        <div class="col-md-4">
+            <div class="stat-card">
+                <h6 class="text-muted fw-bold">Onaylanan mesaj (ACK)</h6>
+                <div id="valAcked" class="stat-value val-success">0</div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="stat-card">
+                <h6 class="text-muted fw-bold">Başarısız / Timeout</h6>
+                <div id="valFailed" class="stat-value val-danger">0</div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="stat-card">
+                <h6 class="text-muted fw-bold">Anlık Hız (msg/sn)</h6>
+                <div id="valRate" class="stat-value val-dark">0</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-3 mb-4">
+        <div class="col-md-4">
+            <div class="stat-card small">
+                <h6 class="text-muted fw-bold mb-0">Bekleyen (ACK gelmemiş)</h6>
+                <div id="valPending" class="stat-value val-dark">0</div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="stat-card small">
+                <h6 class="text-muted fw-bold mb-0">Ortalama Gecikme (ms)</h6>
+                <div id="valAvg" class="stat-value val-dark">0</div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="stat-card small">
+                <h6 class="text-muted fw-bold mb-0">P95 Gecikme (ms)</h6>
+                <div id="valP95" class="stat-value val-dark">0</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Olay Günlüğü -->
+    <h6 class="text-muted fw-bold">Olay Günlüğü</h6>
+    <pre id="eventLog">Henüz olay yok.</pre>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/sockjs-client@1/dist/sockjs.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/stomp.js/2.3.3/stomp.min.js"></script>
+
+<script>
+    let stompClient = null;
+
+    // Sayfa Spring Boot'tan (8080) açıldıysa aynı origin'i kullan, aksi halde localhost:8080'e git
+    const API = (location.protocol.startsWith('http') && location.port === '8080')
+        ? ''
+        : 'http://localhost:8080';
+
+    const fmt = (n) => Number(n || 0).toLocaleString('tr-TR');
+    const fmtMs = (n) => Number(n || 0).toFixed(1);
+
+    function setStatus(text, cls) {
+        const badge = document.getElementById('connectionStatus');
+        badge.innerText = text;
+        badge.className = 'badge p-2 fs-6 ' + cls;
+    }
+
+    let feedbackTimer = null;
+    function showFeedback(text, type) {
+        const box = document.getElementById('feedback');
+        box.className = 'alert alert-' + type;
+        box.innerText = text;
+        clearTimeout(feedbackTimer);
+        feedbackTimer = setTimeout(() => box.classList.add('d-none'), 5000);
+    }
+
+    function renderMetrics(d) {
+        document.getElementById('valAcked').innerText = fmt(d.ackedMessages);
+        document.getElementById('valFailed').innerText = fmt(d.failedMessages);
+        document.getElementById('valRate').innerText = fmt(d.rate);
+        document.getElementById('valPending').innerText = fmt(d.pendingMessages);
+        document.getElementById('valAvg').innerText = fmtMs(d.avgLatency);
+        document.getElementById('valP95').innerText = fmtMs(d.p95Latency);
+
+        const events = d.events || [];
+        const log = document.getElementById('eventLog');
+        const text = events.length ? events.join('\n') : 'Henüz olay yok.';
+        if (log.textContent !== text) {
+            log.textContent = text;
+            log.scrollTop = log.scrollHeight;
+        }
+    }
+
+    // 1. WebSocket bağlantısı
+    function connectWebSocket() {
+        const socket = new SockJS(API + '/ws');
+        stompClient = Stomp.over(socket);
+        stompClient.debug = null;
+
+        stompClient.connect({}, function () {
+            setStatus('Bağlandı', 'bg-success');
+            stompClient.subscribe('/topic/metrics', function (message) {
+                renderMetrics(JSON.parse(message.body));
+            });
+        }, function (error) {
+            console.error('WebSocket bağlantı hatası:', error);
+            setStatus('Bağlantı Hatası', 'bg-danger');
+            setTimeout(connectWebSocket, 3000);
+        });
+    }
+
+    // 2. REST çağrıları
+    async function callApi(path, options) {
+        try {
+            const res = await fetch(API + path, options);
+            let body = null;
+            try { body = await res.json(); } catch (e) { /* gövde boş olabilir */ }
+            if (!res.ok) {
+                showFeedback((body && (body.error || body.status)) || ('HTTP ' + res.status), 'danger');
+                return null;
+            }
+            return body;
+        } catch (err) {
+            showFeedback('Sunucuya ulaşılamadı: ' + err.message, 'danger');
+            return null;
+        }
+    }
+
+    async function startTest(mode) {
+        const payload = {
+            topic: document.getElementById('topicName').value.trim(),
+            messageSize: parseInt(document.getElementById('msgSize').value, 10),
+            totalMessages: parseInt(document.getElementById('msgCount').value, 10),
+            targetRate: parseInt(document.getElementById('msgRate').value, 10),
+            concurrency: parseInt(document.getElementById('concurrency').value, 10),
+            mode: mode
+        };
+        const body = await callApi('/api/test/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        if (body) showFeedback('Test başlatıldı (' + mode + ')', 'success');
+    }
+
+    async function stopTest() {
+        const body = await callApi('/api/test/stop', { method: 'POST' });
+        if (body) showFeedback(body.status === 'stopped' ? 'Test durduruldu' : 'Çalışan test yok', 'secondary');
+    }
+
+    async function markEvent() {
+        const note = prompt('İşaret notu:');
+        if (note === null) return;
+        const body = await callApi('/api/test/mark?note=' + encodeURIComponent(note || 'işaret'), { method: 'POST' });
+        if (body) showFeedback('Olay işaretlendi', 'info');
+    }
+
+    window.onload = connectWebSocket;
+</script>
+</body>
+</html>
